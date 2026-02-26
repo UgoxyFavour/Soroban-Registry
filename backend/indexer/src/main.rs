@@ -96,6 +96,7 @@ impl IndexerService {
                 IndexerState {
                     network: self.config.network.network.clone(),
                     last_indexed_ledger_height: 0,
+                    last_indexed_ledger_hash: None,
                     last_checkpoint_ledger_height: 0,
                     consecutive_failures: 0,
                 }
@@ -153,13 +154,28 @@ impl IndexerService {
         let latest_ledger = self.rpc_client.get_latest_ledger().await?;
         let next_ledger = state.next_ledger_to_process();
 
+        // Calculate lag for observability
+        let indexer_lag = latest_ledger.sequence.saturating_sub(next_ledger);
+
         info!(
             network = network_name,
             latest_ledger = latest_ledger.sequence,
             next_ledger = next_ledger,
-            lag = latest_ledger.sequence.saturating_sub(next_ledger),
+            indexer_lag = indexer_lag,
             "Poll cycle started"
         );
+
+        // FIX(#335): Early return when caught up — avoids fetching a non-existent
+        // future ledger, which would trigger an RPC error and unnecessary backoff.
+        if next_ledger > latest_ledger.sequence {
+            tracing::debug!(
+                network = network_name,
+                latest_ledger = latest_ledger.sequence,
+                next_ledger = next_ledger,
+                "Indexer caught up, nothing to process"
+            );
+            return Ok(());
+        }
 
         // Check for reorg
         if self
@@ -179,8 +195,9 @@ impl IndexerService {
 
         // Process ledgers up to latest (but limit to prevent long processing cycles)
         let max_ledgers_per_cycle = 10;
+        // Safe: next_ledger <= latest_ledger.sequence (guaranteed by the guard above)
         let ledgers_to_process = std::cmp::min(
-            latest_ledger.sequence.saturating_sub(next_ledger) + 1,
+            latest_ledger.sequence - next_ledger + 1,
             max_ledgers_per_cycle,
         );
 
@@ -190,15 +207,19 @@ impl IndexerService {
             let ledger_height = next_ledger + i;
 
             // Fetch ledger details to get the hash
-            let ledger = self.rpc_client.get_ledger(ledger_height).await.map_err(|e| {
-                error!(
-                    network = network_name,
-                    ledger = ledger_height,
-                    error = %e,
-                    "Failed to fetch ledger details"
-                );
-                e
-            })?;
+            let ledger = self
+                .rpc_client
+                .get_ledger(ledger_height)
+                .await
+                .map_err(|e| {
+                    error!(
+                        network = network_name,
+                        ledger = ledger_height,
+                        error = %e,
+                        "Failed to fetch ledger details"
+                    );
+                    e
+                })?;
 
             // Fetch ledger operations
             match self.rpc_client.get_ledger_operations(ledger_height).await {
@@ -285,6 +306,7 @@ impl IndexerService {
             network = network_name,
             processed = ledgers_to_process,
             new_contracts = total_contracts,
+            indexer_lag = indexer_lag.saturating_sub(ledgers_to_process),
             "Poll cycle completed successfully"
         );
 

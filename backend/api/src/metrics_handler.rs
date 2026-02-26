@@ -44,6 +44,7 @@ mod tests {
             cache: Arc::new(CacheLayer::new(CacheConfig::default())),
             registry,
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            health_monitor_status: crate::health_monitor::HealthMonitorStatus::default(),
         }
     }
 

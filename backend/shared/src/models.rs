@@ -199,6 +199,7 @@ pub struct GraphResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PublishRequest {
     pub contract_id: String,
+    pub wasm_hash: String,
     pub name: String,
     pub description: Option<String>,
     pub network: Network,
@@ -1323,6 +1324,59 @@ pub struct AuditLogPage {
     pub total_pages: i64,
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Cursor-based pagination  (issue #337)
+// Used by activity-feed and any future cursor-paginated endpoints.
+// PaginatedResponse (offset-based) above is left completely untouched.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Query parameters for the activity feed endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityFeedParams {
+    /// ISO-8601 timestamp. Only events older than this are returned.
+    /// Omit on the first request; use `next_cursor` from the previous
+    /// response on subsequent requests.
+    pub cursor: Option<DateTime<Utc>>,
+
+    /// How many events to return (default 20, max 100).
+    #[serde(default = "default_activity_limit")]
+    pub limit: i64,
+
+    /// Optionally filter by event type.
+    pub event_type: Option<AnalyticsEventType>,
+}
+
+fn default_activity_limit() -> i64 {
+    20
+}
+
+/// Response for cursor-paginated endpoints.
+/// `next_cursor` is `None` when `has_more` is false (last page).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorPaginatedResponse<T: Serialize> {
+    pub data: Vec<T>,
+    /// Real total matching the applied filters — from COUNT(*).
+    pub total: i64,
+    /// True when more results exist beyond this page.
+    pub has_more: bool,
+    /// Pass this value as `cursor` to fetch the next page.
+    /// `None` on the last page.
+    pub next_cursor: Option<DateTime<Utc>>,
+}
+
+impl<T: Serialize> CursorPaginatedResponse<T> {
+    pub fn new(data: Vec<T>, total: i64, limit: i64, next_cursor: Option<DateTime<Utc>>) -> Self {
+        let has_more = data.len() as i64 == limit;
+        Self {
+            has_more,
+            // Only emit a cursor when there really are more pages.
+            next_cursor: if has_more { next_cursor } else { None },
+            data,
+            total,
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Config Management types
 // ════════════════════════════════════════════════════════════════════════════
@@ -1701,24 +1755,54 @@ pub struct TransparencyLogQueryParams {
     pub offset: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
-#[sqlx(type_name = "health_status", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
     Healthy,
     Warning,
     Critical,
 }
 
+impl std::fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::Warning => write!(f, "warning"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl std::str::FromStr for HealthStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "healthy" => Ok(Self::Healthy),
+            "warning" => Ok(Self::Warning),
+            "critical" => Ok(Self::Critical),
+            other => Err(format!("unknown health status: {}", other)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ContractHealth {
     pub contract_id: Uuid,
-    pub status: HealthStatus,
+    pub status: String,
     pub last_activity: DateTime<Utc>,
     pub security_score: i32,
     pub audit_date: Option<DateTime<Utc>>,
     pub total_score: i32,
     pub recommendations: Vec<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl ContractHealth {
+    /// Returns the typed `HealthStatus` from the stored string.
+    pub fn health_status(&self) -> Result<HealthStatus, String> {
+        self.status.parse()
+    }
 }
 
 // Backup and disaster recovery types
@@ -1779,39 +1863,23 @@ impl std::fmt::Display for ReleaseNotesStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionChange {
     pub name: String,
-    pub change_type: String, // "added", "removed", "modified"
+    pub change_type: String,
     pub old_signature: Option<String>,
     pub new_signature: Option<String>,
     pub is_breaking: bool,
 }
 
 /// Summary of a code diff between two contract versions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DiffSummary {
     pub files_changed: i32,
     pub lines_added: i32,
     pub lines_removed: i32,
     pub function_changes: Vec<FunctionChange>,
     pub has_breaking_changes: bool,
-    /// Category counts: features, fixes, breaking
     pub features_count: i32,
     pub fixes_count: i32,
     pub breaking_count: i32,
-}
-
-impl Default for DiffSummary {
-    fn default() -> Self {
-        Self {
-            files_changed: 0,
-            lines_added: 0,
-            lines_removed: 0,
-            function_changes: Vec::new(),
-            has_breaking_changes: false,
-            features_count: 0,
-            fixes_count: 0,
-            breaking_count: 0,
-        }
-    }
 }
 
 /// Stored release notes generation record
@@ -1834,32 +1902,100 @@ pub struct ReleaseNotesGenerated {
 /// Request to auto-generate release notes for a contract version
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateReleaseNotesRequest {
-    /// The version to generate notes for (must already exist in contract_versions)
     pub version: String,
-    /// Optional explicit previous version to diff against.
-    /// If omitted, the latest version before `version` is used automatically.
     pub previous_version: Option<String>,
-    /// URL to the source repository (used for git diff)
     pub source_url: Option<String>,
-    /// Optional raw CHANGELOG.md content to parse
     pub changelog_content: Option<String>,
-    /// Contract address to include in the notes
     pub contract_address: Option<String>,
 }
 
 /// Request to manually edit release notes before publishing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateReleaseNotesRequest {
-    /// Edited release notes text
     pub notes_text: String,
 }
 
 /// Request to publish (finalize) release notes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishReleaseNotesRequest {
-    /// If true, also update the `release_notes` column on `contract_versions`
     #[serde(default = "default_true")]
     pub update_version_record: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTRACT DEPLOYMENT SIMULATION (Issue #256)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateDeployRequest {
+    pub wasm_binary: String,
+    pub contract_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub network: Network,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub publisher_address: String,
+    #[serde(default)]
+    pub dependencies: Vec<DependencyDeclaration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationResult {
+    pub valid: bool,
+    pub errors: Vec<SimulationError>,
+    pub warnings: Vec<SimulationWarning>,
+    pub gas_estimate: GasEstimate,
+    pub performance_metrics: PerformanceMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abi_preview: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_functions: Option<Vec<ContractFunctionInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationWarning {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GasEstimate {
+    pub total_cost_stroops: i64,
+    pub total_cost_xlm: f64,
+    pub wasm_size_kb: f64,
+    pub complexity_factor: f64,
+    pub deployment_cost_stroops: i64,
+    pub storage_cost_stroops: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceMetrics {
+    pub estimated_execution_time_ms: u64,
+    pub memory_estimate_kb: u64,
+    pub function_count: u32,
+    pub table_size_bytes: u32,
+    pub data_section_bytes: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractFunctionInfo {
+    pub name: String,
+    pub param_count: u32,
+    pub return_type: Option<String>,
+    pub is_view: bool,
 }
 
 fn default_true() -> bool {

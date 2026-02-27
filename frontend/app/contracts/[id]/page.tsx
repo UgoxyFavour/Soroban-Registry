@@ -1,9 +1,9 @@
 "use client";
 
-import { Suspense, useState, useEffect } from "react";
+import { Suspense, useState, useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { Network } from "@/lib/api";
+import type { Network, DependencyTreeNode, GraphNode, GraphEdge } from "@/lib/api";
 import ExampleGallery from "@/components/ExampleGallery";
 import DependencyGraph from "@/components/DependencyGraph";
 import {
@@ -34,6 +34,46 @@ const maintenanceStatus: { is_maintenance: boolean; current_window: null } = {
   is_maintenance: false,
   current_window: null,
 };
+
+/** Flatten a recursive DependencyTreeNode[] into GraphNode[] + GraphEdge[]. */
+function flattenDependencyTree(
+  tree: DependencyTreeNode[],
+  network: Network = "mainnet"
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  const nodes: GraphNode[] = [];
+  const edges: GraphEdge[] = [];
+  const seen = new Set<string>();
+
+  function walk(node: DependencyTreeNode, parentId?: string) {
+    if (!seen.has(node.contract_id)) {
+      seen.add(node.contract_id);
+      nodes.push({
+        id: node.contract_id,
+        contract_id: node.contract_id,
+        name: node.name,
+        network,
+        is_verified: false,
+        tags: [],
+      });
+    }
+    if (parentId) {
+      edges.push({
+        source: parentId,
+        target: node.contract_id,
+        dependency_type: node.constraint_to_parent || "dependency",
+      });
+    }
+    for (const child of node.dependencies) {
+      walk(child, node.contract_id);
+    }
+  }
+
+  for (const root of tree) {
+    walk(root);
+  }
+  return { nodes, edges };
+}
+
 function ContractDetailsContent() {
   const params = useParams();
   const searchParams = useSearchParams();
@@ -59,6 +99,12 @@ function ContractDetailsContent() {
     queryFn: () => api.getContractDependencies(id),
     enabled: !!contract,
   });
+
+  const depGraph = useMemo(
+    () => (dependencies ? flattenDependencyTree(dependencies, selectedNetwork) : null),
+    [dependencies, selectedNetwork]
+  );
+
   const { logEvent } = useAnalytics();
 
   useEffect(() => {
@@ -196,11 +242,11 @@ function ContractDetailsContent() {
                 <div className="h-96 bg-gray-200 dark:bg-gray-800 rounded-lg" />
               </div>
             </section>
-          ) : dependencies ? (
+          ) : depGraph && depGraph.nodes.length > 0 ? (
             <section>
               <DependencyGraph
-                nodes={dependencies.nodes ?? []}
-                edges={dependencies.edges ?? []}
+                nodes={depGraph.nodes}
+                edges={depGraph.edges}
               />
             </section>
           ) : null}

@@ -316,7 +316,12 @@ async fn resolve_call_target_contract(
 
     dependency::resolve_contract_id(db, &identifier)
         .await
-        .map_err(|err| ApiError::internal(format!("Failed to resolve interaction target contract: {}", err)))
+        .map_err(|err| {
+            ApiError::internal(format!(
+                "Failed to resolve interaction target contract: {}",
+                err
+            ))
+        })
 }
 
 async fn record_contract_interaction(

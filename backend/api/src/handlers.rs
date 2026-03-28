@@ -24,6 +24,7 @@ use shared::{
     TopUser, TrendingParams,
     UpdateContractMetadataRequest, UpdateContractStatusRequest, VerifyRequest,
 };
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -33,6 +34,13 @@ pub struct GetContractQuery {
     pub network: Option<Network>,
     pub from_search: Option<bool>,
     pub search_query: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct BatchContractsQuery {
+    /// Comma-separated list of fields to include in each contract result.
+    /// Example: fields=name,address,network
+    pub fields: Option<String>,
 }
 
 use crate::{
@@ -426,6 +434,54 @@ fn extract_ip_address(headers: &HeaderMap) -> String {
     }
 
     "unknown".to_string()
+}
+
+fn parse_batch_fields(raw_fields: Option<&str>) -> Option<HashSet<String>> {
+    let set: HashSet<String> = raw_fields
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect();
+
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+fn contract_to_filtered_value(contract: &Contract, fields: Option<&HashSet<String>>) -> Value {
+    if fields.is_none() {
+        return serde_json::to_value(contract).unwrap_or_else(|_| Value::Null);
+    }
+
+    let Some(source) = serde_json::to_value(contract)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+    else {
+        return Value::Null;
+    };
+
+    let mut out = serde_json::Map::new();
+    let selected = fields.expect("checked above");
+
+    for field in selected {
+        if field == "address" {
+            out.insert(
+                "address".to_string(),
+                Value::String(contract.contract_id.clone()),
+            );
+            continue;
+        }
+
+        if let Some(value) = source.get(field) {
+            out.insert(field.clone(), value.clone());
+        }
+    }
+
+    Value::Object(out)
 }
 
 async fn write_contract_audit_log(
@@ -1305,6 +1361,81 @@ pub async fn get_contract(
         current_network,
         network_config,
     }))
+}
+
+/// Fetch multiple contracts in a single request, preserving request order.
+#[utoipa::path(
+    post,
+    path = "/api/contracts/batch",
+    params(BatchContractsQuery),
+    request_body = Vec<String>,
+    responses(
+        (status = 200, description = "Batch contract results in request order", body = [Object]),
+        (status = 400, description = "Invalid request")
+    ),
+    tag = "Contracts"
+)]
+pub async fn get_contracts_batch(
+    State(state): State<AppState>,
+    Query(query): Query<BatchContractsQuery>,
+    Json(contract_ids): Json<Vec<String>>,
+) -> ApiResult<Json<Vec<Option<Value>>>> {
+    if contract_ids.len() > 100 {
+        return Err(ApiError::bad_request(
+            "BatchTooLarge",
+            format!(
+                "Maximum of 100 contract IDs allowed, received {}",
+                contract_ids.len()
+            ),
+        ));
+    }
+
+    let fields = parse_batch_fields(query.fields.as_deref());
+
+    let parsed_uuids: Vec<Uuid> = contract_ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id.trim()).ok())
+        .collect();
+
+    let normalized_contract_ids: Vec<String> = contract_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let contracts: Vec<Contract> = sqlx::query_as(
+        "SELECT * FROM contracts
+         WHERE id = ANY($1)
+            OR contract_id = ANY($2)",
+    )
+    .bind(&parsed_uuids)
+    .bind(&normalized_contract_ids)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("get batch contracts", err))?;
+
+    let mut by_uuid: HashMap<Uuid, Contract> = HashMap::new();
+    let mut by_contract_id: HashMap<String, Contract> = HashMap::new();
+
+    for contract in contracts {
+        by_contract_id.insert(contract.contract_id.clone(), contract.clone());
+        by_uuid.insert(contract.id, contract);
+    }
+
+    let mut ordered_results: Vec<Option<Value>> = Vec::with_capacity(contract_ids.len());
+    for requested in contract_ids {
+        let trimmed = requested.trim();
+
+        let contract = Uuid::parse_str(trimmed)
+            .ok()
+            .and_then(|id| by_uuid.get(&id))
+            .or_else(|| by_contract_id.get(trimmed));
+
+        ordered_results.push(contract.map(|c| contract_to_filtered_value(c, fields.as_ref())));
+    }
+
+    Ok(Json(ordered_results))
 }
 
 #[utoipa::path(
@@ -3732,10 +3863,12 @@ pub async fn route_not_found() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use prometheus::Registry;
     use sqlx::postgres::PgPoolOptions;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_health_check_shutdown_returns_503() {

@@ -1,21 +1,10 @@
-"use client";
-
-import { Contract } from "@/lib/api";
-import {
-  CheckCircle2,
-  Check,
-  Clock,
-  Copy,
-  ExternalLink,
-  Layers3,
-  Tag,
-  User,
-} from "lucide-react";
-import Link from "next/link";
-import React from "react";
-import HealthWidget from "./HealthWidget";
-import { useAnalytics } from "@/hooks/useAnalytics";
-import { useRouter } from "next/navigation";
+import { Contract } from '@/lib/api';
+import { Clock, ExternalLink, Tag } from 'lucide-react';
+import Link from 'next/link';
+import React from 'react';
+import HealthWidget from './HealthWidget';
+import { useAnalytics } from '@/hooks/useAnalytics';
+import VerificationBadge from '@/components/verification/VerificationBadge';
 
 interface ContractCardProps {
   contract: Contract;
@@ -98,12 +87,16 @@ export default function ContractCard({ contract }: ContractCardProps) {
           {/* Header */}
           <div className="flex items-start justify-between mb-3 gap-3">
             <div className="flex-1 min-w-0">
-              <h3 className="text-lg font-semibold text-foreground group-hover:text-primary transition-colors truncate">
-                {contract.name}
-              </h3>
-              <p className="text-xs text-muted-foreground flex items-center gap-1.5 mt-1 min-w-0">
-                <User className="w-3.5 h-3.5 shrink-0" />
-                <span className="truncate">{creator}</span>
+              <div className="flex items-center gap-2 mb-1">
+                <h3 className="text-lg font-semibold text-foreground group-hover:text-primary transition-colors truncate">
+                  {contract.name}
+                </h3>
+                {contract.is_verified && (
+                  <VerificationBadge status="approved" />
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground font-mono">
+                {contract.contract_id.slice(0, 8)}...{contract.contract_id.slice(-6)}
               </p>
             </div>
 

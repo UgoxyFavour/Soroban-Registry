@@ -143,10 +143,22 @@ pub fn contract_routes() -> Router<AppState> {
             "/api/contracts/:id/impact",
             get(handlers::get_impact_analysis),
         )
+        .route(
+            "/api/contracts/:id/similar",
+            get(similarity_handlers::get_similar_contracts),
+        )
+        .route(
+            "/contracts/:id/similar",
+            get(similarity_handlers::get_similar_contracts),
+        )
         .route("/api/contracts/verify", post(handlers::verify_contract))
         .route(
             "/api/contracts/batch-verify",
             post(batch_verify_handlers::batch_verify_contracts),
+        )
+        .route(
+            "/api/contracts/similarity/analyze",
+            post(similarity_handlers::analyze_contract_similarity_batch),
         )
         .route(
             "/api/contracts/:id/performance",
